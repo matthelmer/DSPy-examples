@@ -9,6 +9,7 @@
 ## Requirements
 
 - Currently requires OpenAI API key
+- Local python environment setup
 
 ## Usage
 

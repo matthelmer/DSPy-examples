@@ -5,7 +5,7 @@ from dspy.datasets.gsm8k import GSM8K, gsm8k_metric
 from dspy.evaluate import Evaluate
 from dspy.predict import Retry
 from dspy.primitives.assertions import assert_transform_module, backtrack_handler
-from dspy.teleprompt import BootstrapFewShot
+from dspy.teleprompt import BootstrapFewShotWithRandomSearch
 from dotenv import load_dotenv
 
 # loads .env file, which should contain API keys
@@ -25,9 +25,21 @@ class GenerateAnswerChoices(dspy.Signature):
     number_of_choices = dspy.InputField()
     answer_choices = dspy.OutputField(desc='JSON key-value pairs')
 
+class QuizAnswerGenerator(dspy.Module):
+    """Generate 'n' answer choices to a question using a JSON signature.
+    """
+    def __init__(self):
+        super().__init__()
+        self.generate_choices = dspy.ChainOfThought(GenerateAnswerChoices)
+
+    def forward(self, question, answer):
+        choices = self.generate_choices(question=question, correct_answer=answer, number_of_choices='4').answer_choices
+        return dspy.Prediction(choices=choices)
+
 
 class QuizAnswerGeneratorWithAssertions(dspy.Module):
     """Generate 'n' answer choices to a question using JSON signature.
+    Uses Assertions to reiterate and enforce our constraints.
     """
     def __init__(self):
         super().__init__()
@@ -121,6 +133,9 @@ def main():
     devset = [x.with_inputs('question', 'answer') for x in gsm8k.dev]
 
     # set up a quiz generator
+    quiz_generator = QuizAnswerGenerator()
+
+    # set up a quiz generator with assertions
     quiz_generator_with_assertions = assert_transform_module(QuizAnswerGeneratorWithAssertions().map_named_predictors(Retry), backtrack_handler)
 
     metrics = [
@@ -130,21 +145,93 @@ def main():
             overall_metric,
             ]
 
+    # each of 3 test examples below will:
+    # generate few-shot demonstrations and conduct a random search over the
+    # candidates to output the best compiled program
+
+
+    # 1) test without assertions
+    teleprompter = BootstrapFewShotWithRandomSearch(metric=overall_metric,
+                                                    max_bootstrapped_demos=2,
+                                                    num_candidate_programs=6)
+
+    compiled_quiz_generator = teleprompter.compile(
+            student=quiz_generator,
+            teacher=quiz_generator,
+            trainset=trainset,
+            valset=devset[:100])
+
     for metric in metrics:
+        evaluate = Evaluate(metric=metric,
+                            devset=devset,
+                            num_threads=1,
+                            display_progress=True,
+                            )
+        evaluate(compiled_quiz_generator)
 
-        evaluate = Evaluate(metric=metric, devset=devset, num_threads=1,
-                            display_progress=True)
 
-        evaluate(quiz_generator_with_assertions)
+    # 2) test_compilation_with_teacher_assertions
+    teleprompter = BootstrapFewShotWithRandomSearch(metric=overall_metric,
+                                                    max_bootstrapped_demos=2,
+                                                    num_candidate_programs=6)
 
+    compiled_with_teacher_assertions_quiz_generator = teleprompter.compile(
+            student=quiz_generator,
+            teacher=quiz_generator_with_assertions,
+            trainset=trainset,
+            valset=devset[:100])
+
+    for metric in metrics:
+        evaluate = Evaluate(metric=metric,
+                            devset=devset,
+                            num_threads=1,
+                            display_progress=True,
+                            )
+        evaluate(compiled_with_teacher_assertions_quiz_generator)
+
+
+    # 3) test compilation with both student and teacher assertions
+    teleprompter = BootstrapFewShotWithRandomSearch(metric=overall_metric,
+                                                    max_bootstrapped_demos=2,
+                                                    num_candidate_programs=6)
+
+    compiled_with_assertions_quiz_generator = teleprompter.compile(
+            student=quiz_generator,
+            teacher=quiz_generator_with_assertions,
+            trainset=trainset,
+            valset=devset[:100])
+
+    for metric in metrics:
+        evaluate = Evaluate(metric=metric,
+                            devset=devset,
+                            num_threads=1,
+                            display_progress=True,
+                            )
+        evaluate(compiled_with_assertions_quiz_generator)
+
+    # load a random example for comparison across 3 compiled quiz generators
     import random
     example = random.choice(devset)
 
-    quiz_choices = quiz_generator_with_assertions(question=example.question,
-                                                  answer=example.answer)
     print(f'Quiz Question: ', example.question)
-    print(f'Generated Quiz Choices: ', quiz_choices.choices)
     print(f'Quiz Answer: ', example.answer)
+
+    quiz_choices_no_assertions = compiled_quiz_generator(
+            question=example.question,
+            answer=example.answer,
+            )
+    quiz_choices_teacher_assertions = compiled_with_teacher_assertions_quiz_generator(
+            question=example.question,
+            answer=example.answer,
+            )
+    quiz_choices_assertions = compiled_with_assertions_quiz_generator(
+            question=example.question,
+            answer=example.answer,
+            )
+
+    print(f'Generated Quiz Choices (no assertions): ', quiz_choices_no_assertions.choices)
+    print(f'Generated Quiz Choices (teacher assertions): ', quiz_choices_teacher_assertions.choices)
+    print(f'Generated Quiz Choices (teacher and student assertions): ', quiz_choices_assertions.choices)
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 # DSPy Example Python Code
 
-**Samples of re-written DSPy tutorial code for educational purposes**
+**DSPy tutorials, modified for educational purposes**
 
 ## Examples
 
@@ -8,10 +8,11 @@
 
 ## Requirements
 
+- Install via pip: ```$ pip install -r requirements.txt```
 - Currently requires OpenAI API key
-- Local python environment setup
+- Local python environment setup required
 
 ## Usage
-
-- More coming soon, currently run as main:
+- To use use your OpenAI API key, create a file called `.env` inside the same directory as your code, and add the following line: ```OPENAI_API_KEY='<your_key_value_here>'```
+- More coming soon, currently run as main to demonstrate generating a random math quiz question with Assertions:
 ```$ python math_quiz_assertions.py```

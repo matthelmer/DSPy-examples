@@ -2,6 +2,7 @@
 __pycache__
 .python-version
 *.db
+chroma_db
 *.log
 local_cache
 venv

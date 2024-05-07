@@ -58,8 +58,12 @@ def add_youtube_transcript_to_vector_db(youtube_video_url):
     print("Finished adding YouTube transcript to Chroma DB.")
 
 
-def get_retriever():
+def make_retriever():
+    """Makes a chromadb retrieval client using OpenAI embedding function.
+    Retrieves documents from YouTube transcripts collection in vector db.
+    """
     from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+
     # set up retrieval client with chromadb
     embedding_function = OpenAIEmbeddingFunction(
             api_key=os.environ.get('OPENAI_API_KEY'),
@@ -74,6 +78,4 @@ def get_retriever():
         k=5
     )
 
-    turbo = dspy.OpenAI(model='gpt-3.5-turbo-instruct', max_tokens=300)
-    dspy.settings.configure(lm=turbo, rm=retriever_model)
     return retriever_model

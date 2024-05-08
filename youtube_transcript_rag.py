@@ -77,5 +77,4 @@ def make_retriever():
         embedding_function=embedding_function,
         k=5
     )
-
     return retriever_model

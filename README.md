@@ -1,8 +1,8 @@
-# DSPy Example Python Code
+# DSPy Code Examples
+## DSPy tutorials and example code, modified and remixed for educational purposes
 
-**DSPy tutorials, modified for educational purposes**
 
-## Examples
+## Example Programs
 
 - Math Quiz Generator using Assertions (GSM8k dataset)
 - SEC Filing 10-Q RAG as a compiled DSPy program
@@ -10,7 +10,7 @@
 
 ## Requirements
 
-- Install via pip: ```$ pip install -r requirements.txt```
+- Install dependencies via pip: ```$ pip install -r requirements.txt```
 - OpenAI API key
 
 ## Usage

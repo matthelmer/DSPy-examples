@@ -4,13 +4,14 @@ import dspy
 import random
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from dsp.utils import deduplicate
+from dspy import evaluate as dspy_eval
 from dspy.retrieve.chromadb_rm import ChromadbRM
+from dspy.teleprompt import BootstrapFewShot
 from edgar import Company, set_identity, get_filings
-from financial_datasets.generator import DatasetGenerator
 from financial_datasets.parser import FilingParser
-from langchain_community.embeddings import OpenAIEmbeddings
 from langchain.schema.document import Document
 from langchain_chroma import Chroma
+from langchain_openai.embeddings import OpenAIEmbeddings
 from langchain_text_splitters import TokenTextSplitter
 from dotenv import load_dotenv
 
@@ -18,9 +19,13 @@ dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path)
 
+# import DatasetGenerator after loading .env, because need OPENAI_API_KEY
+from financial_datasets.generator import DatasetGenerator
+
 
 class GenerateAnswer(dspy.Signature):
-    """Answer questions with short factoid answers."""
+    """Answer questions with short factoid answer."""
+
     context = dspy.InputField(desc="may contain relevant facts")
     question = dspy.InputField()
     answer = dspy.OutputField(desc="often between 1 and 5 words")
@@ -28,17 +33,25 @@ class GenerateAnswer(dspy.Signature):
 
 class GenerateSearchQuery(dspy.Signature):
     """Write a simple search query that will help answer a complex question."""
+
     context = dspy.InputField(desc="may contain relevant facts")
     question = dspy.InputField()
     query = dspy.OutputField()
 
 
+def retrieve_passages(collection_name, query, k):
+    retriever = make_retriever(collection_name, k)
+    return [r["long_text"] for r in retriever(query)]
+
+
 class SimplifiedBaleen(dspy.Module):
-    def __init__(self, passages_per_hop=3, max_hops=2):
+    def __init__(self, collection_name, passages_per_hop=2, max_hops=3):
         super().__init__()
 
-        self.generate_query = [dspy.ChainOfThought(GenerateSearchQuery) for _ in range(max_hops)]
-        self.retrieve = dspy.Retrieve(k=passages_per_hop)
+        self.collection_name = collection_name  # chromadb
+        self.generate_query = [dspy.ChainOfThought(GenerateSearchQuery) \
+                for _ in range(max_hops)]
+        self.passages_per_hop = passages_per_hop
         self.generate_answer = dspy.ChainOfThought(GenerateAnswer)
         self.max_hops = max_hops
 
@@ -46,39 +59,44 @@ class SimplifiedBaleen(dspy.Module):
         context = []
 
         for hop in range(self.max_hops):
-            query = self.generate_query[hop](context=context, question=question).query
-            passages = self.retrieve(query).passages
+
+            query = self.generate_query[hop](
+                    context=context,question=question
+                    ).query
+
+            passages = retrieve_passages(self.collection_name, query,
+                                         self.passages_per_hop)
+
             context = deduplicate(context + passages)
 
         pred = self.generate_answer(context=context, question=question)
+
         return dspy.Prediction(context=context, answer=pred.answer)
 
 
-def validate_context_and_answer_and_hops(example, pred, trace=None):
-    if not dspy.evaluate.answer_exact_match(example, pred):
-        return False
-
-    if not dspy.evaluate.answer_passage_match(example, pred):
+def validate_answer_and_hops(example, pred, trace=None):
+    # check if predicted answer is match
+    if not dspy_eval.answer_exact_match(example, pred, frac=0.9):
         return False
 
     hops = [example.question] + \
             [outputs.query for *_, outputs in trace if 'query' in outputs]
 
+    # check that queries for for hops aren't too long
     if max([len(h) for h in hops]) > 100:
         return False
 
+    # check that queries sufficiently different
     if any(
-        dspy.evaluate.answer_exact_match_str(hops[idx], hops[:idx], frac=0.8)
+        dspy_eval.answer_exact_match_str(hops[idx], hops[:idx], frac=0.8)
         for idx in range(2, len(hops))
     ):
         return False
-
     return True
 
 
 def prepare_examples(generated_dataset):
     """Turn generated dataset into DSPy-friendly dataset of Examples."""
-
     # DSPy Example objects, each w/ 'question', 'answer', and 'golden_context'
     qca_dataset = []
 
@@ -95,8 +113,8 @@ def prepare_examples(generated_dataset):
     random.seed(2024)
     random.shuffle(qca_dataset)
 
-    train_set = qca_dataset[: int(0.8 * len(qca_dataset))]
-    dev_set = qca_dataset[int(0.8 * len(qca_dataset)) :]
+    train_set = qca_dataset[: int(0.3 * len(qca_dataset))]
+    dev_set = qca_dataset[int(0.3 * len(qca_dataset)) :]
 
     print("Finished preparing train_set and dev_set")
     print(f"{len(train_set)}, {len(dev_set)}")
@@ -104,7 +122,7 @@ def prepare_examples(generated_dataset):
     return train_set, dev_set
 
 
-def make_10Q_documents(ticker, year, quarter, item_names=[]):
+def make_10Q_docs(ticker, year, quarter, item_names=[]):
     """Uses Financial Datasets to get 10Q items, returns chunked Documents.
     """
     filing_parser = FilingParser()
@@ -112,9 +130,8 @@ def make_10Q_documents(ticker, year, quarter, item_names=[]):
     set_identity(sec_identity)
 
     # get filing items
-    items = filing_parser.get_10Q_items(
-            ticker, year, quarter, item_names, sec_identity
-    )
+    items = filing_parser.get_10Q_items(ticker, year, quarter, item_names,
+                                        sec_identity)
     chunk_size = 1024
     chunk_overlap = 100
     token_splitter = TokenTextSplitter(
@@ -144,7 +161,7 @@ def generate_dataset_from_docs(documents, max_questions=20):
     """
     # Financial Datasets dataset generator
     g = DatasetGenerator(
-            model="gpt-4-0125-preview", api_key=os.getenv('OPENAI_API_KEY')
+            model="gpt-4o", api_key=os.getenv('OPENAI_API_KEY')
     )
 
     # list of all of our chunks of text from the filing
@@ -170,19 +187,18 @@ def store_docs_as_chroma_collection(documents, collection_name):
     print("Done.")
 
 
-def make_retriever(collection_name):
+def make_retriever(collection_name, k=3):
     """Makes a chromadb retrieval client using OpenAI embedding function.
     Retrieves documents from specified collection in chroma db.
     """
     # set up retrieval client with chromadb
     embedding_function = OpenAIEmbeddingFunction(
             api_key=os.environ.get('OPENAI_API_KEY'),
-            model_name="text-embedding-ada-002",
     )
 
     # DSPy retrieval client attached to the named Chroma collection
-    rm = ChromadbRM(collection_name, './chroma_db',
-                    embedding_function=embedding_function, k=7)
+    rm = ChromadbRM(collection_name, './chroma_db', k=k,
+                    embedding_function=embedding_function)
     return rm
 
 
@@ -191,54 +207,67 @@ def main():
     ticker = 'META'
     year = 2023
     qtr = 4
+    collection_name = ticker + "_10Q_" + str(year) + "Q" + str(qtr)
 
-    # set collection name for ticker's 10Q report
-    collection_name = ticker + "-10Q-filings-" + str(year) + "-Q" + str(qtr)
+    print(f"Collection Name: {collection_name}")
 
-    print(f"Getting 10Q filing for {ticker} from {year}, Q{qtr}...")
-    # get 10Q filing items from SEC Edgar, then chunk into documents
-    sec_10Q_docs = make_10Q_documents(ticker, year, qtr, item_names=[])
+    # downloads 10Q filing from Edgar, chunks into documents
+    chunked_docs = make_10Q_docs(ticker, year, qtr, item_names=[])
 
-    max_questions = 10
+    # store 10Q filing docs in their own chroma db collection
+    store_docs_as_chroma_collection(chunked_docs, collection_name)
 
-    print(f"Generating up to {max_questions} examples for dataset...")
+    max_questions = 40
+
+    print(f"Generating up to {max_questions} examples for dataset.")
 
     # generate question and answer pairs from the 10Q filing text docs
     dataset = generate_dataset_from_docs(
-            sec_10Q_docs, max_questions=max_questions
+            chunked_docs, max_questions=max_questions
     )
 
     trainset, devset = prepare_examples(dataset)
-    print("Finished preparing dataset of examples.")
 
-    # store 10Q filing docs in their own chroma db collection
-    store_docs_as_chroma_collection(sec_10Q_docs, collection_name)
+    print("Finished preparing examples from dataset.")
+    print("Add functionality to persist dataset!")
 
     # configure language model and retriever model
-    lm = dspy.OpenAI(model='gpt-4-0125-preview')
+    lm = dspy.OpenAI(model="gpt-4o")
     rm = make_retriever(collection_name)
+
     dspy.settings.configure(lm=lm, rm=rm, trace=[])
 
-    # test queries
-    my_queries = [
-            "How does this company make most of its revenue?",
-            "What are the biggest research focus areas going forward?",
-            "What are the key operating risks faced by this company?",
-            "Which products are unprofitable?",
-    ]
-
     # execute pipeline using zero-shot (uncompiled) setting
-    uncompiled_baleen = SimplifiedBaleen()
+    uncompiled_baleen = SimplifiedBaleen(collection_name)
 
-    print("Running un-optimized (zero-shot) Baleen pipeline...")
+    teleprompter = BootstrapFewShot(metric=validate_answer_and_hops)
 
-    for my_query in my_queries:
-        pred = uncompiled_baleen(my_query)
-        print(f"\nQuestion:\n{my_query}")
-        print(f"Predicted Answer:\n{pred.answer}")
-        print(
-                f"Retrieved Contexts (truncated):\n"
-                f"{[c[:100] + '...' for c in pred.context]}"
-        )
+    compiled_baleen = teleprompter.compile(
+            SimplifiedBaleen(collection_name),
+            teacher=SimplifiedBaleen(collection_name),
+            trainset=trainset
+    )
+
+    evaluate_on_devset_qa = dspy_eval.Evaluate(
+            devset=devset, num_threads=1, display_progress=True
+    )
+
+    print("Evaluating `uncompiled_baleen` answer match scores...")
+    uncompiled_baleen_answer_score = evaluate_on_devset_qa(
+            uncompiled_baleen,
+            metric=dspy_eval.answer_exact_match
+    )
+
+    print("Evaluating `compiled_baleen` answer match scores...")
+    compiled_baleen_answer_score = evaluate_on_devset_qa(
+            compiled_baleen,
+            metric=dspy_eval.answer_exact_match
+    )
+
+    print(f"## Answer Match Score for `uncompiled_baleen`: {uncompiled_baleen_answer_score}")
+    print(f"## Answer Match Score for `compiled_baleen`: {compiled_baleen_answer_score}")
 
     return lm, trainset, devset
+
+if __name__ == '__main__':
+    main()

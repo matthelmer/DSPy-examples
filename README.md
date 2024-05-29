@@ -1,5 +1,5 @@
 # DSPy Code Examples
-## DSPy tutorials and example code, modified and remixed for educational purposes
+DSPy tutorials and example code, modified and remixed for educational purposes
 
 
 ## Example Programs
